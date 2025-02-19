@@ -79,47 +79,65 @@ func (s *HostScanner) Scan(target string) ([]ScanResult, error) {
 func (s *HostScanner) scanNetwork(ipNet *net.IPNet) []ScanResult {
 	var results []ScanResult
 	var wg sync.WaitGroup
-	resultChan := make(chan ScanResult)
+	var resultMutex sync.Mutex
 	semaphore := make(chan struct{}, s.Concurrency)
 
-	// 获取网段的第一个和最后一个IP
-	firstIP := ipNet.IP
-	mask := ipNet.Mask
-	networkSize := addressCount(mask) - 2 // 减去网络地址和广播地址
+	// 获取网段的起始IP（跳过网络地址）
+	ip := ipNet.IP.Mask(ipNet.Mask)
+	ip = incrementIP(ip) // 跳过网络地址
 
-	go func() {
-		for ip := incrementIP(firstIP); networkSize > 0; ip = incrementIP(ip) {
-			wg.Add(1)
-			go func(ip net.IP) {
-				defer wg.Done()
-				semaphore <- struct{}{}        // 获取信号量
-				defer func() { <-semaphore }() // 释放信号量
+	// 计算最后一个可用IP（排除广播地址）
+	lastIP := make(net.IP, len(ip))
+	copy(lastIP, ip)
+	for i := range lastIP {
+		lastIP[i] = ip[i] | ^ipNet.Mask[i]
+	}
+	lastIP = decrementIP(lastIP) // 排除广播地址
 
-				ipStr := ip.String()
-				alive := s.IsHostAlive(ipStr)
-				resultChan <- ScanResult{
-					IP:    ipStr,
-					Alive: alive,
-				}
-			}(copyIP(ip))
-			networkSize--
+	// 遍历IP地址范围（从第一个可用IP到最后一个可用IP）
+	for !ip.Equal(incrementIP(lastIP)) {
+		if !ipNet.Contains(ip) {
+			continue
 		}
-		wg.Wait()
-		close(resultChan)
-	}()
 
-	// 收集结果
-	for result := range resultChan {
-		results = append(results, result)
+		wg.Add(1)
+		semaphore <- struct{}{} // 获取信号量
+
+		go func(currentIP net.IP) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // 释放信号量
+
+			ipStr := currentIP.String()
+			alive := s.IsHostAlive(ipStr)
+
+			if alive {
+				resultMutex.Lock()
+				results = append(results, ScanResult{
+					IP:    ipStr,
+					Alive: true,
+				})
+				resultMutex.Unlock()
+			}
+		}(copyIP(ip))
+
+		ip = incrementIP(ip)
 	}
 
+	wg.Wait()
 	return results
 }
 
-// 辅助函数：计算网段中的地址数量
-func addressCount(mask net.IPMask) int {
-	ones, bits := mask.Size()
-	return 1 << uint(bits-ones)
+// 新增：decrementIP 函数用于递减IP地址
+func decrementIP(ip net.IP) net.IP {
+	newIP := copyIP(ip)
+	for i := len(newIP) - 1; i >= 0; i-- {
+		if newIP[i] > 0 {
+			newIP[i]--
+			break
+		}
+		newIP[i] = 255
+	}
+	return newIP
 }
 
 // 辅助函数：递增IP地址
@@ -143,45 +161,38 @@ func copyIP(ip net.IP) net.IP {
 
 // IsHostAlive 检查主机是否存活
 func (s *HostScanner) IsHostAlive(ip string) bool {
-	// 首先尝试 ICMP ping
-	if s.pingCheck(ip) {
-		return true
-	}
-
-	// 如果 ICMP 失败，尝试 TCP 端口探测
-	return s.tcpCheck(ip)
+	// 只使用 ping 检测
+	return s.pingCheck(ip)
 }
 
-// pingCheck 使用 ICMP ping 检测主机
+// pingCheck 使用ICMP ping检测主机
 func (s *HostScanner) pingCheck(ip string) bool {
 	var cmd *exec.Cmd
 
-	// 根据操作系统选择不同的 ping 命令
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("ping", "-n", "1", "-w", "1000", ip)
-	default: // Linux, macOS, etc.
-		cmd = exec.Command("ping", "-c", "1", "-W", "1", ip)
+		cmd = exec.Command("ping", ip, "-n", "1", "-w", "200")
+	case "linux":
+		cmd = exec.Command("/bin/sh", "-c", "ping -c 1 "+ip)
+	case "darwin":
+		cmd = exec.Command("ping", ip, "-c", "1", "-W", "200")
+	case "freebsd":
+		cmd = exec.Command("ping", "-c", "1", "-W", "200", ip)
+	case "openbsd":
+		cmd = exec.Command("ping", "-c", "1", "-w", "200", ip)
+	case "netbsd":
+		cmd = exec.Command("ping", "-c", "1", "-w", "2", ip)
+	default:
+		cmd = exec.Command("ping", "-c", "1", ip)
 	}
 
-	// 执行 ping 命令
-	err := cmd.Run()
-	return err == nil
-}
-
-// tcpCheck 使用 TCP 连接检测主机
-func (s *HostScanner) tcpCheck(ip string) bool {
-	// 常用端口列表
-	commonPorts := []string{"80", "443", "22", "21", "3389"}
-
-	for _, port := range commonPorts {
-		address := net.JoinHostPort(ip, port)
-		conn, err := net.DialTimeout("tcp", address, s.Timeout)
-		if err == nil {
-			conn.Close()
+	// 执行命令并检查输出中是否包含 TTL
+	if output, err := cmd.Output(); err == nil {
+		outputStr := strings.ToLower(string(output))
+		if strings.Contains(outputStr, "ttl=") {
+			fmt.Printf("Host %s is alive\n", ip)
 			return true
 		}
 	}
-
 	return false
 }
